@@ -1,0 +1,500 @@
+name: Call Quality Assessment Pipeline
+
+on:
+  schedule:
+    - cron: '0 * * * *'          # каждый час (можно отключить)
+  workflow_dispatch:
+    inputs:
+      audio_key:
+        description: 'Specific audio file key to process (optional)'
+        required: false
+        type: string
+  push:
+    branches: [ main, develop ]
+    paths:
+      - '.github/workflows/quality-assessment.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  # Yandex Cloud S3-compatible storage settings (используем те же имена, что в веб-приложении)
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+  AWS_REGION: ru-central1
+
+  # Buckets
+  RAW_BUCKET: raw-recordings
+  TRANSCRIPTS_BUCKET: transcripts
+  REPORTS_BUCKET: analysis-reports
+
+  # Yandex SpeechKit
+  SPEECHKIT_API_KEY: ${{ secrets.SPEECHKIT_API_KEY }}
+  SPEECHKIT_FOLDER_ID: ${{ secrets.SPEECHKIT_FOLDER_ID }}
+
+  # GigaChat
+  GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
+  GIGACHAT_SCOPE: GIGACHAT_API_PERS
+
+  # Telegram
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+jobs:
+  process-recordings:
+    name: Process Audio Recordings
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 requests python-dotenv tenacity urllib3
+
+      - name: Create temporary directories
+        run: |
+          mkdir -p ./temp/audio
+          mkdir -p ./temp/transcripts
+          mkdir -p ./temp/reports
+
+      - name: Get list of unprocessed audio files
+        id: get-files
+        env:
+          INPUT_AUDIO_KEY: ${{ inputs.audio_key }}
+        run: |
+          python << 'EOF'
+          import boto3
+          import os
+          from datetime import datetime
+
+          session = boto3.session.Session()
+          s3 = session.client(
+              's3',
+              endpoint_url=os.environ['AWS_ENDPOINT_URL'],
+              aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+              aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY']
+          )
+
+          response = s3.list_objects_v2(
+              Bucket=os.environ['RAW_BUCKET'],
+              Prefix=''
+          )
+
+          audio_extensions = ('.mp3', '.wav', '.ogg', '.m4a', '.flac')
+          audio_files = []
+          if 'Contents' in response:
+              for obj in response['Contents']:
+                  key = obj['Key']
+                  if key.lower().endswith(audio_extensions) and not key.startswith('processed/'):
+                      audio_files.append(key)
+
+          with open('./temp/audio_files.txt', 'w') as f:
+              for audio_file in audio_files:
+                  f.write(f"{audio_file}\n")
+
+          print(f"Found {len(audio_files)} unprocessed audio files")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"audio_count={len(audio_files)}\n")
+              if audio_files:
+                  if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch':
+                      specific_key = os.environ.get('INPUT_AUDIO_KEY')
+                      if specific_key and specific_key in audio_files:
+                          f.write(f"specific_file={specific_key}\n")
+          EOF
+
+      - name: Process audio file
+        if: steps.get-files.outputs.audio_count > 0
+        env:
+          SPECIFIC_FILE: ${{ inputs.audio_key }}
+        run: |
+          python << 'EOF'
+          import boto3
+          import requests
+          import json
+          import os
+          import time
+          import uuid
+          import re
+          import urllib3
+          from tenacity import retry, stop_after_attempt, wait_exponential
+          from datetime import datetime
+
+          urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+          RAW_BUCKET = os.environ['RAW_BUCKET']
+          TRANSCRIPTS_BUCKET = os.environ['TRANSCRIPTS_BUCKET']
+          REPORTS_BUCKET = os.environ['REPORTS_BUCKET']
+
+          session = boto3.session.Session()
+          s3 = session.client(
+              's3',
+              endpoint_url=os.environ['AWS_ENDPOINT_URL'],
+              aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+              aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY']
+          )
+
+          with open('./temp/audio_files.txt', 'r') as f:
+              audio_files = [line.strip() for line in f.readlines()]
+
+          if os.environ.get('SPECIFIC_FILE'):
+              audio_files = [os.environ['SPECIFIC_FILE']]
+
+          def escape_markdown(text):
+              if text is None:
+                  return "N/A"
+              special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+              for char in special_chars:
+                  text = str(text).replace(char, f'\\{char}')
+              return text
+
+          def get_audio_config(audio_key):
+              if audio_key.lower().endswith('.mp3'):
+                  return {"audioEncoding": "MP3"}
+              elif audio_key.lower().endswith('.wav'):
+                  return {"audioEncoding": "LPCM", "sampleRateHertz": 8000}
+              elif audio_key.lower().endswith('.ogg'):
+                  return {"audioEncoding": "OGG_OPUS"}
+              elif audio_key.lower().endswith('.flac'):
+                  return {"audioEncoding": "FLAC"}
+              else:
+                  return {"audioEncoding": "LPCM", "sampleRateHertz": 8000}
+
+          def transcribe_audio(audio_key):
+              print(f"🎙️ Transcribing: {audio_key}")
+              audio_path = f"./temp/audio/{os.path.basename(audio_key)}"
+              s3.download_file(RAW_BUCKET, audio_key, audio_path)
+              print(f"✅ Downloaded audio: {audio_path}")
+
+              audio_config = get_audio_config(audio_key)
+              url = "https://transcribe.api.cloud.yandex.net/speech/stt/v2/longrunningRecognize"
+              body = {
+                  "config": {
+                      "specification": {
+                          "languageCode": "ru-RU",
+                          "model": "general",
+                          **audio_config,
+                          "audioChannelCount": 1,
+                          "literatureText": False,
+                          "profanityFilter": False,
+                          "enableSpeakerLabeling": True
+                      }
+                  },
+                  "audio": {
+                      "uri": f"https://storage.yandexcloud.net/{RAW_BUCKET}/{audio_key}"
+                  }
+              }
+              headers = {
+                  "Authorization": f"Api-Key {os.environ['SPEECHKIT_API_KEY']}",
+                  "x-folder-id": os.environ['SPEECHKIT_FOLDER_ID'],
+                  "Content-Type": "application/json"
+              }
+
+              response = requests.post(url, json=body, headers=headers, timeout=30)
+              response.raise_for_status()
+              operation_id = response.json()['id']
+              print(f"🔄 Recognition started, operation_id: {operation_id}")
+
+              max_attempts = 60
+              attempts = 0
+              while attempts < max_attempts:
+                  status_response = requests.get(
+                      f"https://operation.api.cloud.yandex.net/operations/{operation_id}",
+                      headers={"Authorization": f"Api-Key {os.environ['SPEECHKIT_API_KEY']}"},
+                      timeout=30
+                  )
+                  status_response.raise_for_status()
+                  data = status_response.json()
+                  if data.get('done', False):
+                      break
+                  print("⏳ Waiting for recognition to complete...")
+                  time.sleep(5)
+                  attempts += 1
+
+              if attempts >= max_attempts:
+                  raise TimeoutError(f"Recognition timed out after {max_attempts * 5} seconds")
+
+              transcript = ""
+              speaker_labels = []
+              if 'response' in data and 'chunks' in data['response']:
+                  for chunk in data['response']['chunks']:
+                      if 'alternatives' in chunk and chunk['alternatives']:
+                          text = chunk['alternatives'][0]['text']
+                          transcript += text + " "
+                          if 'channelTag' in chunk:
+                              speaker = "operator" if chunk['channelTag'] == 1 else "client"
+                              speaker_labels.append({
+                                  "speaker": speaker,
+                                  "text": text,
+                                  "start_time": chunk.get('startTime', 0),
+                                  "end_time": chunk.get('endTime', 0)
+                              })
+
+              transcript_key = f"transcripts/{os.path.splitext(os.path.basename(audio_key))[0]}.json"
+              transcript_data = {
+                  "audio_file": audio_key,
+                  "transcript": transcript.strip(),
+                  "speaker_labels": speaker_labels,
+                  "timestamp": datetime.now().isoformat()
+              }
+              s3.put_object(
+                  Bucket=TRANSCRIPTS_BUCKET,
+                  Key=transcript_key,
+                  Body=json.dumps(transcript_data, ensure_ascii=False, indent=2),
+                  ContentType="application/json"
+              )
+              print(f"✅ Transcript saved to: {transcript_key}")
+              return transcript_key, transcript_data
+
+          @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+          def analyze_with_gigachat(transcript_data):
+              print("🤖 Analyzing transcript with GigaChat...")
+
+              auth_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+              auth_headers = {
+                  "Authorization": f"Bearer {os.environ['GIGACHAT_CREDENTIALS']}",
+                  "RqUID": str(uuid.uuid4()),
+                  "Content-Type": "application/x-www-form-urlencoded"
+              }
+              auth_data = {"scope": os.environ['GIGACHAT_SCOPE']}
+              auth_response = requests.post(auth_url, headers=auth_headers, data=auth_data, verify=False, timeout=30)
+              auth_response.raise_for_status()
+              access_token = auth_response.json()['access_token']
+
+              system_prompt = """
+              Ты - эксперт по оценке качества обслуживания клиентов.
+              Проанализируй диалог между оператором и клиентом по следующим критериям:
+
+              1. Соблюдение скрипта обслуживания:
+                 - Приветствие
+                 - Представление
+                 - Выявление потребности
+                 - Предложение решения
+                 - Прощание
+
+              2. Оценка удовлетворенности клиента:
+                 - Тональность речи
+                 - Использование вежливых формулировок
+                 - Наличие/отсутствие жалоб
+
+              3. Ключевые проблемы:
+                 - Основные сложности в диалоге
+                 - Недостатки в работе оператора
+
+              4. Рекомендации по улучшению
+
+              Верни ответ строго в формате JSON со следующей структурой:
+              {
+                "overall_score": "число от 1 до 5",
+                "adherence_to_script": {
+                  "greeting": true/false,
+                  "introduction": true/false,
+                  "needs_identification": true/false,
+                  "solution_proposal": true/false,
+                  "farewell": true/false,
+                  "score": "число от 0 до 5"
+                },
+                "customer_satisfaction": {
+                  "sentiment": "positive/neutral/negative",
+                  "score": "число от 1 до 5",
+                  "key_phrases": ["фраза1", "фраза2"]
+                },
+                "key_issues": ["проблема1", "проблема2"],
+                "recommendations": ["рекомендация1", "рекомендация2"],
+                "summary": "краткое резюме диалога"
+              }
+              """
+
+              user_message = f"""
+              Диалог между оператором и клиентом:
+
+              {transcript_data['transcript']}
+
+              Детальная разметка по спикерам:
+              {json.dumps(transcript_data['speaker_labels'], ensure_ascii=False, indent=2)}
+              """
+
+              chat_url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+              chat_headers = {
+                  "Authorization": f"Bearer {access_token}",
+                  "Content-Type": "application/json"
+              }
+              chat_body = {
+                  "model": "GigaChat",
+                  "messages": [
+                      {"role": "system", "content": system_prompt},
+                      {"role": "user", "content": user_message}
+                  ],
+                  "temperature": 0.7,
+                  "max_tokens": 2000
+              }
+              response = requests.post(chat_url, headers=chat_headers, json=chat_body, verify=False, timeout=60)
+              response.raise_for_status()
+              result = response.json()
+              content = result['choices'][0]['message']['content']
+
+              try:
+                  json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                  if json_match:
+                      analysis = json.loads(json_match.group())
+                  else:
+                      analysis = json.loads(content)
+              except json.JSONDecodeError as e:
+                  print(f"⚠️ Failed to parse JSON: {e}")
+                  print(f"Response content: {content}")
+                  analysis = {
+                      "overall_score": 3,
+                      "adherence_to_script": {"score": 3},
+                      "customer_satisfaction": {"score": 3, "sentiment": "neutral"},
+                      "key_issues": ["Unable to parse analysis"],
+                      "recommendations": ["Check GigaChat response format"],
+                      "summary": content[:500]
+                  }
+              return analysis
+
+          def save_report(audio_key, transcript_key, analysis):
+              print("💾 Saving analysis report...")
+              report_key = f"reports/{os.path.splitext(os.path.basename(audio_key))[0]}.json"
+              report_data = {
+                  "audio_file": audio_key,
+                  "transcript_file": transcript_key,
+                  "analysis": analysis,
+                  "processed_at": datetime.now().isoformat(),
+                  "status": "completed"
+              }
+              s3.put_object(
+                  Bucket=REPORTS_BUCKET,
+                  Key=report_key,
+                  Body=json.dumps(report_data, ensure_ascii=False, indent=2),
+                  ContentType="application/json"
+              )
+              print(f"✅ Report saved to: {report_key}")
+              return report_key, report_data
+
+          def send_telegram_notification(report_data):
+              print(" Sending Telegram notification...")
+              try:
+                  analysis = report_data.get('analysis', {})
+                  os.makedirs('./temp/reports', exist_ok=True)
+
+                  overall_score = escape_markdown(analysis.get('overall_score', 'N/A'))
+                  script_score = escape_markdown(analysis.get('adherence_to_script', {}).get('score', 'N/A'))
+                  sentiment = escape_markdown(analysis.get('customer_satisfaction', {}).get('sentiment', 'N/A'))
+                  satisfaction_score = escape_markdown(analysis.get('customer_satisfaction', {}).get('score', 'N/A'))
+                  summary = escape_markdown(analysis.get('summary', '')[:200])
+
+                  message = f"""
+                  *Новый отчет по качеству обслуживания*
+
+                  *Общая оценка:* {overall_score}/5
+
+                  *Соблюдение скрипта:* {script_score}/5
+
+                  *Удовлетворенность клиента:* {sentiment} ({satisfaction_score}/5)
+
+                  *Ключевые проблемы:*
+                  """
+                  for issue in analysis.get('key_issues', []):
+                      message += f"\n• {escape_markdown(issue)}"
+
+                  message += "\n\n *Рекомендации:*"
+                  for rec in analysis.get('recommendations', []):
+                      message += f"\n• {escape_markdown(rec)}"
+
+                  message += f"\n\n *Резюме:*\n{summary}..."
+
+                  url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
+                  payload = {
+                      "chat_id": os.environ['TELEGRAM_CHAT_ID'],
+                      "text": message,
+                      "parse_mode": "Markdown"
+                  }
+                  response = requests.post(url, json=payload, timeout=30)
+                  response.raise_for_status()
+
+                  with open('./temp/reports/latest_report.json', 'w', encoding='utf-8') as f:
+                      json.dump(report_data, f, ensure_ascii=False, indent=2)
+
+                  doc_url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendDocument"
+                  with open('./temp/reports/latest_report.json', 'rb') as f:
+                      files = {'document': f}
+                      data = {'chat_id': os.environ['TELEGRAM_CHAT_ID'], 'caption': 'Полный отчет в формате JSON'}
+                      doc_response = requests.post(doc_url, data=data, files=files, timeout=30)
+                      doc_response.raise_for_status()
+
+                  print("Notification sent successfully")
+                  return True
+              except Exception as e:
+                  print(f" Failed to send Telegram notification: {str(e)}")
+                  return False
+
+          results = []
+          for audio_file in audio_files:
+              print(f"\n{'='*60}")
+              print(f"Processing: {audio_file}")
+              print(f"{'='*60}\n")
+              try:
+                  transcript_key, transcript_data = transcribe_audio(audio_file)
+                  analysis = analyze_with_gigachat(transcript_data)
+                  report_key, report_data = save_report(audio_file, transcript_key, analysis)
+                  send_telegram_notification(report_data)
+                  results.append({
+                      "audio_file": audio_file,
+                      "status": "success",
+                      "report_key": report_key
+                  })
+                  print(f"\n Successfully processed: {audio_file}\n")
+              except Exception as e:
+                  print(f"\n Failed to process {audio_file}: {str(e)}\n")
+                  results.append({
+                      "audio_file": audio_file,
+                      "status": "failed",
+                      "error": str(e)
+                  })
+
+          with open('./temp/processing_summary.json', 'w') as f:
+              json.dump(results, f, indent=2)
+
+          success_count = sum(1 for r in results if r['status'] == 'success')
+          failed_count = len(results) - success_count
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"processed_count={len(results)}\n")
+              f.write(f"success_count={success_count}\n")
+              f.write(f"failed_count={failed_count}\n")
+
+          print(f"\n{'='*60}")
+          print(f"SUMMARY: {success_count} succeeded, {failed_count} failed")
+          print(f"{'='*60}")
+          EOF
+
+      - name: Upload processing summary
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: processing-summary
+          path: ./temp/processing_summary.json
+
+      - name: Upload error logs
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: error-logs
+          path: ./temp/
+
+      - name: Cleanup temporary files
+        if: always()
+        run: |
+          rm -rf ./temp/audio
+          rm -rf ./temp/transcripts
+          rm -f ./temp/audio_files.txt
